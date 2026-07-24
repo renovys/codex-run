@@ -4,6 +4,11 @@
 # 실제 codex를 호출하지 않으므로 API 사용량·과금이 발생하지 않는다.
 param([string]$Wrapper)
 
+# GitHub Actions 등 일부 실행기는 셸을 $ErrorActionPreference="Stop" 으로 띄운다.
+# 래퍼는 사용법 오류를 stderr 로 내는데(bash 판과 같은 계약), 그 상태에서는 네이티브 명령의
+# stderr 가 NativeCommandError 종료성 예외로 승격돼 "정상적인 거부"를 검증하다 테스트가 죽는다.
+$ErrorActionPreference = "Continue"
+
 if (-not $Wrapper) {
   $Wrapper = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) "codex-run.ps1"
 }
