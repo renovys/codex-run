@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# codex-run — GPT-5.6 Sol(codex) 위임 실행 래퍼
+# 목적: codex가 무응답으로 매달리는 상황을 상한 시간·무출력 정체로 감지해 프로세스 트리째 정리하고,
+#       본체 에이전트가 이어받을 수 있도록 로그 경로와 종료 사유를 표준 형식으로 남긴다.
+# 사용: codex-run [--timeout SEC] [--stall SEC] [--stdin FILE] [--tail N] [--codex-bin PATH]
+#                  [--help] [--version] [--] <codex 인자...>
+#   예: codex-run --timeout 900 exec --sandbox danger-full-access "프롬프트"
+# 종료코드: 0=정상 / 124=전체 상한 초과 / 125=무출력 정체 / 2=사용법·인자 오류 / 그 외=codex 자체 종료코드
+# 맥 bash 3.2 호환(연관배열·flock 미사용).
+set -u
+
+VERSION="0.1.0"
+
+usage() {
+  cat <<'EOF'
+사용법:
+  codex-run [--timeout SEC] [--stall SEC] [--stdin FILE] [--tail N] [--codex-bin PATH]
+            [--help] [--version] [--] <codex 인자...>
+
+옵션:
+  --timeout SEC     전체 상한(초, 기본값: 900, 1 이상)
+  --stall SEC       무출력 정체 감시(초, 기본값: 0=끔)
+  --stdin FILE      codex 표준입력으로 사용할 일반 파일
+  --tail N          종료 후 출력할 로그 줄 수(기본값: 40)
+  --codex-bin PATH  codex 실행 파일(기본값: codex)
+  --help            이 도움말 출력
+  --version         버전 출력
+  --                래퍼 인자 파싱 종료
+
+환경변수:
+  CODEX_RUN_TIMEOUT, CODEX_RUN_STALL, CODEX_RUN_TAIL, CODEX_BIN
+EOF
+}
+
+die() { echo "codex-run: $1" >&2; exit 2; }
+is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+validate_num() { # $1=이름, $2=값, $3=최솟값
+  is_num "$2" || die "$1 값은 숫자여야 한다"
+  [ "$2" -ge "$3" ] 2>/dev/null || die "$1 값은 $3 이상이어야 한다"
+}
+
+if [ "${CODEX_RUN_TIMEOUT+x}" = "x" ]; then LIMIT="$CODEX_RUN_TIMEOUT"; else LIMIT=900; fi
+if [ "${CODEX_RUN_STALL+x}" = "x" ]; then STALL="$CODEX_RUN_STALL"; else STALL=0; fi
+if [ "${CODEX_RUN_TAIL+x}" = "x" ]; then TAIL_LINES="$CODEX_RUN_TAIL"; else TAIL_LINES=40; fi
+STDIN_FILE="/dev/null"
+CODEX_BIN="${CODEX_BIN:-codex}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --timeout)   [ $# -ge 2 ] || die "--timeout 값이 없다"; validate_num "--timeout" "$2" 1; LIMIT="$2"; shift 2 ;;
+    --stall)     [ $# -ge 2 ] || die "--stall 값이 없다";   validate_num "--stall" "$2" 0; STALL="$2"; shift 2 ;;
+    --stdin)     [ $# -ge 2 ] || die "--stdin 값이 없다"; [ -f "$2" ] && [ -r "$2" ] || die "stdin 일반 파일을 읽을 수 없다: $2"; STDIN_FILE="$2"; shift 2 ;;
+    --tail)      [ $# -ge 2 ] || die "--tail 값이 없다";    validate_num "--tail" "$2" 0; TAIL_LINES="$2"; shift 2 ;;
+    --codex-bin) [ $# -ge 2 ] || die "--codex-bin 값이 없다"; [ -n "$2" ] || die "--codex-bin 값이 비어 있다"; CODEX_BIN="$2"; shift 2 ;;
+    --help)      usage; exit 0 ;;
+    --version)   echo "codex-run $VERSION"; exit 0 ;;
+    --)          shift; break ;;
+    *)           break ;;
+  esac
+done
+
+validate_num "--timeout/CODEX_RUN_TIMEOUT" "$LIMIT" 1
+validate_num "--stall/CODEX_RUN_STALL" "$STALL" 0
+validate_num "--tail/CODEX_RUN_TAIL" "$TAIL_LINES" 0
+[ $# -gt 0 ] || die "인자가 없다. 사용법은 codex-run --help"
+
+LOGDIR="$HOME/.codex-runs"
+(umask 077; mkdir -p "$LOGDIR")
+chmod 700 "$LOGDIR" || die "로그 디렉터리 권한을 설정할 수 없다: $LOGDIR"
+find "$LOGDIR" -name '*.log' -mtime +30 -delete 2>/dev/null   # 30일 지난 실행 로그 정리
+STAMP="$(date +%Y%m%d-%H%M%S)"
+LOG="$LOGDIR/$STAMP-$$.log"
+(umask 077; : > "$LOG")
+chmod 600 "$LOG" || die "로그 파일 권한을 설정할 수 없다: $LOG"
+
+mtime_of() {   # 파일 수정시각(epoch) — 리눅스/맥 분기
+  if stat -c %Y "$1" 2>/dev/null; then return 0; fi
+  stat -f %m "$1" 2>/dev/null
+}
+
+# exec 위임에 --skip-git-repo-check 자동 부착 (git 저장소 밖이면 codex가 즉시 거부한다)
+if [ "${1:-}" = "exec" ]; then
+  HAS_SKIP=0
+  for a in "$@"; do [ "$a" = "--skip-git-repo-check" ] && HAS_SKIP=1; done
+  if [ "$HAS_SKIP" != "1" ]; then
+    shift
+    set -- exec --skip-git-repo-check "$@"
+  fi
+fi
+
+# job control을 켜면 백그라운드 자식이 자기 프로세스 그룹의 리더가 된다(PGID=자식 PID).
+# 덕분에 종료 시 손자까지 그룹 단위로 한 번에 정리할 수 있다.
+set -m
+
+kill_tree() {   # $1 = 시그널
+  kill -"$1" -"$CPID" 2>/dev/null     # 프로세스 그룹 전체
+  pkill -"$1" -P "$CPID" 2>/dev/null  # 그룹 밖으로 빠진 직계가 있으면 함께
+  kill -"$1" "$CPID" 2>/dev/null
+}
+
+cleanup() {     # 래퍼가 밖에서 죽어도 codex를 고아로 남기지 않는다
+  [ -n "${CPID:-}" ] || return 0
+  kill_tree TERM
+  sleep 5
+  kill_tree KILL
+  wait "$CPID" 2>/dev/null
+}
+trap 'cleanup; exit 143' INT TERM HUP
+
+START=$SECONDS
+{
+  echo "# codex-run 실행: $(date '+%Y-%m-%d %H:%M:%S') / 상한 ${LIMIT}초 / 정체 ${STALL}초 / stdin ${STDIN_FILE}"
+  echo "# 명령: $CODEX_BIN $*"
+  echo "#---"
+} >> "$LOG"
+
+# stdin은 기본 /dev/null로 막는다 — 열어두면 codex가 추가 입력을 무한정 기다려 매달린다.
+"$CODEX_BIN" "$@" >>"$LOG" 2>&1 <"$STDIN_FILE" &
+CPID=$!
+set +m
+
+LAST_MTIME=""
+if CURRENT_MTIME="$(mtime_of "$LOG")"; then LAST_MTIME="$CURRENT_MTIME"; fi
+LAST_ACTIVITY=$SECONDS
+
+REASON="ok"
+DECISION_ELAPSED=0
+while kill -0 "$CPID" 2>/dev/null; do
+  sleep 1
+  kill -0 "$CPID" 2>/dev/null || break   # sleep 중 정상 종료 — 상한 판정하지 않는다
+  NOW=$SECONDS
+  ELAPSED=$(( NOW - START ))
+  if [ "$ELAPSED" -ge "$LIMIT" ]; then
+    REASON="timeout"
+    DECISION_ELAPSED=$ELAPSED
+    break
+  fi
+  # stat 실패 시에는 이 회차의 정체 판정만 건너뛴다.
+  if CURRENT_MTIME="$(mtime_of "$LOG")"; then
+    if [ -z "$LAST_MTIME" ] || [ "$CURRENT_MTIME" != "$LAST_MTIME" ]; then
+      LAST_MTIME="$CURRENT_MTIME"
+      LAST_ACTIVITY=$NOW
+    fi
+    IDLE=$(( NOW - LAST_ACTIVITY ))
+    if [ "$STALL" -gt 0 ] && [ "$IDLE" -ge "$STALL" ]; then
+      REASON="stall"
+      DECISION_ELAPSED=$ELAPSED
+      break
+    fi
+  fi
+done
+
+if [ "$REASON" = "ok" ]; then
+  wait "$CPID"
+  RC=$?
+  DECISION_ELAPSED=$(( SECONDS - START ))
+else
+  kill_tree TERM
+  sleep 5
+  # 리더가 먼저 죽었더라도 TERM을 무시한 손자가 남을 수 있으므로 그룹에 항상 KILL을 보낸다.
+  kill_tree KILL
+  wait "$CPID" 2>/dev/null
+  if [ "$REASON" = "timeout" ]; then RC=124; else RC=125; fi
+fi
+trap - INT TERM HUP
+
+# 남은 프로세스가 없는지 확인 — 있으면 본체가 이어받기 전에 알아야 한다
+LEFT=0
+kill -0 "$CPID" 2>/dev/null && LEFT=1
+kill -0 -"$CPID" 2>/dev/null && LEFT=1
+
+TOTAL_ELAPSED=$(( SECONDS - START ))
+echo "----- codex 출력(마지막 ${TAIL_LINES}줄) -----"
+tail -n "$TAIL_LINES" "$LOG"
+echo "----- codex-run 요약 -----"
+case "$REASON" in
+  ok)      echo "상태: 정상 종료 (codex 종료코드 $RC)" ;;
+  timeout) echo "상태: 전체 상한 ${LIMIT}초 초과로 강제 종료 — 본체가 이어받을 것" ;;
+  stall)   echo "상태: ${STALL}초간 무출력 정체(추정)로 강제 종료 — 본체가 이어받을 것" ;;
+esac
+[ "$LEFT" = "1" ] && echo "경고: 종료되지 않은 codex 프로세스가 남아 있다(PID $CPID) — 재위임 전에 확인할 것"
+echo "판정 시각: ${DECISION_ELAPSED}초 / 총 경과: ${TOTAL_ELAPSED}초 / 로그 전문: $LOG"
+echo "codex-run: status=$REASON exit_code=$RC elapsed_sec=$TOTAL_ELAPSED log=$LOG"
+exit "$RC"
