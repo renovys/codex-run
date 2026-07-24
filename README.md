@@ -1,5 +1,7 @@
 # codex-run
 
+[![test](https://github.com/renovys/codex-run/actions/workflows/test.yml/badge.svg)](https://github.com/renovys/codex-run/actions/workflows/test.yml)
+
 A watchdog wrapper for the [OpenAI Codex CLI](https://github.com/openai/codex) that keeps `codex exec` from hanging forever in unattended automation.
 
 `codex exec` is great in a terminal, where a human notices when it stops responding. In cron jobs, CI steps, and headless agent pipelines there is nobody watching — a stuck run just sits there holding a process slot until someone finds it hours later. `codex-run` puts a time limit on the run, kills the whole process tree when it trips, and reports *why* it stopped through a standard exit code so the calling script can decide what to do next.
