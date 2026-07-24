@@ -16,14 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: bash 버전 확인
+      - name: Check bash version
         run: bash --version | head -1
 
-      - name: 문법 검증
+      - name: Check syntax
         run: bash -n codex-run && bash -n test/run-tests.sh
 
-      # macOS 러너의 기본 /bin/bash 는 3.2 라 이식성 회귀를 여기서 잡는다
-      - name: 시나리오 검증
+      # The macOS runner's default /bin/bash is 3.2, so this catches portability regressions.
+      - name: Run scenarios
         run: ./test/run-tests.sh
 
   powershell:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 구문 파싱 검증 (PowerShell 5.1)
+      - name: Check syntax parsing (PowerShell 5.1)
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -39,8 +39,8 @@ jobs:
           [System.Management.Automation.PSParser]::Tokenize(
             (Get-Content -Raw codex-run.ps1), [ref]$errors) | Out-Null
           if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host $_.Message }; exit 1 }
-          Write-Host "구문 OK"
+          Write-Host "Syntax OK"
 
-      - name: 시나리오 검증
+      - name: Run scenarios
         shell: powershell
         run: .\test\run-tests.ps1
