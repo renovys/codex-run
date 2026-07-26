@@ -67,7 +67,7 @@ validate_num "--tail/CODEX_RUN_TAIL" "$TAIL_LINES" 0
 LOGDIR="$HOME/.codex-runs"
 (umask 077; mkdir -p "$LOGDIR")
 chmod 700 "$LOGDIR" || die "cannot set log directory permissions: $LOGDIR"
-find "$LOGDIR" -name '*.log' -mtime +30 -delete 2>/dev/null   # Prune run logs older than 30 days.
+find "$LOGDIR" -name '*.log' -mtime +14 -delete 2>/dev/null   # Prune run logs older than 14 days.
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG="$LOGDIR/$STAMP-$$.log"
 (umask 077; : > "$LOG")

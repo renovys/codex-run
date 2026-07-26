@@ -35,7 +35,7 @@ It also prints a language-neutral status line that automation can parse without 
 codex-run: status=timeout exit_code=124 elapsed_sec=15 log=/home/you/.codex-runs/20260724-233844-2986093.log
 ```
 
-**Writes a standard log** to `~/.codex-runs/<timestamp>-<pid>.log` and prints the path in its summary, so a failed run leaves a breadcrumb you can pick up later. The directory is created `0700` and logs `0600`, because the command line - which may carry your prompt - is recorded in the header. Logs older than 30 days are pruned automatically.
+**Writes a standard log** to `~/.codex-runs/<timestamp>-<pid>.log` and prints the path in its summary, so a failed run leaves a breadcrumb you can pick up later. The directory is created `0700` and logs `0600`, because the command line - which may carry your prompt - is recorded in the header. Logs older than 14 days are pruned automatically.
 
 **Adds `--skip-git-repo-check` to `exec` calls.** Codex refuses to run outside a git repository, which is a surprising failure mode for a cron job working in a scratch directory. The flag is injected only for the `exec` subcommand, and only when you have not already passed it.
 

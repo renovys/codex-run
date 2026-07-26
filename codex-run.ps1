@@ -268,8 +268,8 @@ if (-not (Test-Path -LiteralPath $logDir -PathType Container)) {
   New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 }
 Get-ChildItem -LiteralPath $logDir -Filter *.log -ErrorAction SilentlyContinue |
-  Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
-  Remove-Item -Force -ErrorAction SilentlyContinue   # Prune run logs older than 30 days.
+  Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
+  Remove-Item -Force -ErrorAction SilentlyContinue   # Prune run logs older than 14 days.
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $runId = "$stamp-$PID-$([Guid]::NewGuid().ToString('N'))"
