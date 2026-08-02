@@ -45,6 +45,13 @@ if [ "${CODEX_RUN_TAIL+x}" = "x" ]; then TAIL_LINES="$CODEX_RUN_TAIL"; else TAIL
 STDIN_FILE="/dev/null"
 CODEX_BIN="${CODEX_BIN:-codex}"
 
+# codex CLI 는 구독 로그인(auth.json)을 주 경로로 쓴다. 환경에 API 키가 남아 있으면
+# 의도치 않게 종량 과금 경로가 선택될 수 있어 자식 프로세스에서 제거한다.
+# 키로 쓰고 싶으면 CODEX_RUN_KEEP_API_KEY=1 로 끈다.
+if [ "${CODEX_RUN_KEEP_API_KEY:-0}" != "1" ]; then
+  unset OPENAI_API_KEY OPENAI_BASE_URL
+fi
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --timeout)   [ $# -ge 2 ] || die "--timeout requires a value"; validate_num "--timeout" "$2" 1; LIMIT="$2"; shift 2 ;;
