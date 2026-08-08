@@ -27,6 +27,8 @@ Options:
   --version         Print version
   --                Stop parsing wrapper arguments
 
+래퍼 플래그는 exec 앞에 쓰는 것이 정석이며, exec 뒤에 와도 자동 교정됩니다.
+
 Environment:
   CODEX_RUN_TIMEOUT, CODEX_RUN_STALL, CODEX_RUN_TAIL, CODEX_BIN
 '@
@@ -58,6 +60,13 @@ function Convert-ValidatedNumber([string]$Name, [AllowNull()][string]$Value, [lo
 function Require-NextValue([string]$Name, [int]$Index, [int]$Count) {
   if (($Index + 1) -ge $Count) {
     Fail-Argument "$Name requires a value"
+  }
+}
+
+function Write-LiftNotice([string]$Name, [bool]$SeenBefore) {
+  [Console]::Error.WriteLine("[codex-run] notice: '$Name' is a wrapper flag and belongs before 'exec'; its position was auto-corrected.")
+  if ($SeenBefore) {
+    [Console]::Error.WriteLine("[codex-run] notice: '$Name' was given both before and after 'exec'; the later value wins.")
   }
 }
 
@@ -181,16 +190,26 @@ $CodexArgs = @()
 $timeoutFromCli = $false
 $stallFromCli = $false
 $tailFromCli = $false
+$stdinFromCli = $false
+$codexBinFromCli = $false
+$wrapperParseStopped = $false
 
 $i = 0
 while ($i -lt $AllArgs.Count) {
   $current = $AllArgs[$i]
-  switch ($current) {
+  switch -Wildcard ($current) {
     "--timeout" {
       Require-NextValue "--timeout" $i $AllArgs.Count
       $TimeoutSec = Convert-ValidatedNumber "--timeout" $AllArgs[$i + 1] 1
       $timeoutFromCli = $true
       $i += 2
+      continue
+    }
+    "--timeout=*" {
+      $value = $current.Substring("--timeout=".Length)
+      $TimeoutSec = Convert-ValidatedNumber "--timeout" $value 1
+      $timeoutFromCli = $true
+      $i++
       continue
     }
     "--stall" {
@@ -200,11 +219,33 @@ while ($i -lt $AllArgs.Count) {
       $i += 2
       continue
     }
+    "--stall=*" {
+      $value = $current.Substring("--stall=".Length)
+      $StallSec = Convert-ValidatedNumber "--stall" $value 0
+      $stallFromCli = $true
+      $i++
+      continue
+    }
     "--stdin" {
       Require-NextValue "--stdin" $i $AllArgs.Count
       if ([string]::IsNullOrEmpty($AllArgs[$i + 1])) { Fail-Argument "--stdin value is empty" }
+      if (-not (Test-Path -LiteralPath $AllArgs[$i + 1] -PathType Leaf)) {
+        Fail-Argument "cannot read stdin regular file: $($AllArgs[$i + 1])"
+      }
       $StdinFile = $AllArgs[$i + 1]
+      $stdinFromCli = $true
       $i += 2
+      continue
+    }
+    "--stdin=*" {
+      $value = $current.Substring("--stdin=".Length)
+      if ([string]::IsNullOrEmpty($value)) { Fail-Argument "--stdin value is empty" }
+      if (-not (Test-Path -LiteralPath $value -PathType Leaf)) {
+        Fail-Argument "cannot read stdin regular file: $value"
+      }
+      $StdinFile = $value
+      $stdinFromCli = $true
+      $i++
       continue
     }
     "--tail" {
@@ -214,11 +255,27 @@ while ($i -lt $AllArgs.Count) {
       $i += 2
       continue
     }
+    "--tail=*" {
+      $value = $current.Substring("--tail=".Length)
+      $TailLines = Convert-ValidatedNumber "--tail" $value 0
+      $tailFromCli = $true
+      $i++
+      continue
+    }
     "--codex-bin" {
       Require-NextValue "--codex-bin" $i $AllArgs.Count
       if ([string]::IsNullOrEmpty($AllArgs[$i + 1])) { Fail-Argument "--codex-bin value is empty" }
       $CodexBin = $AllArgs[$i + 1]
+      $codexBinFromCli = $true
       $i += 2
+      continue
+    }
+    "--codex-bin=*" {
+      $value = $current.Substring("--codex-bin=".Length)
+      if ([string]::IsNullOrEmpty($value)) { Fail-Argument "--codex-bin value is empty" }
+      $CodexBin = $value
+      $codexBinFromCli = $true
+      $i++
       continue
     }
     "--help" {
@@ -230,6 +287,7 @@ while ($i -lt $AllArgs.Count) {
       exit 0
     }
     "--" {
+      $wrapperParseStopped = $true
       $i++
       if ($i -lt $AllArgs.Count) { $CodexArgs = @($AllArgs[$i..($AllArgs.Count - 1)]) }
       $i = $AllArgs.Count
@@ -239,6 +297,128 @@ while ($i -lt $AllArgs.Count) {
       $CodexArgs = @($AllArgs[$i..($AllArgs.Count - 1)])
       $i = $AllArgs.Count
       continue
+    }
+  }
+}
+
+if (-not $wrapperParseStopped -and $CodexArgs.Count -gt 0) {
+  $RemainingArgs = @($CodexArgs)
+  $CodexArgs = @()
+  $j = 0
+  while ($j -lt $RemainingArgs.Count) {
+    $current = $RemainingArgs[$j]
+    switch -Wildcard ($current) {
+      "--" {
+        $CodexArgs += @($RemainingArgs[$j..($RemainingArgs.Count - 1)])
+        $j = $RemainingArgs.Count
+        continue
+      }
+      "--timeout" {
+        Require-NextValue "--timeout" $j $RemainingArgs.Count
+        $value = $RemainingArgs[$j + 1]
+        $validated = Convert-ValidatedNumber "--timeout" $value 1
+        Write-LiftNotice "--timeout" $timeoutFromCli
+        $TimeoutSec = $validated
+        $timeoutFromCli = $true
+        $j += 2
+        continue
+      }
+      "--timeout=*" {
+        $value = $current.Substring("--timeout=".Length)
+        $validated = Convert-ValidatedNumber "--timeout" $value 1
+        Write-LiftNotice "--timeout" $timeoutFromCli
+        $TimeoutSec = $validated
+        $timeoutFromCli = $true
+        $j++
+        continue
+      }
+      "--stall" {
+        Require-NextValue "--stall" $j $RemainingArgs.Count
+        $value = $RemainingArgs[$j + 1]
+        $validated = Convert-ValidatedNumber "--stall" $value 0
+        Write-LiftNotice "--stall" $stallFromCli
+        $StallSec = $validated
+        $stallFromCli = $true
+        $j += 2
+        continue
+      }
+      "--stall=*" {
+        $value = $current.Substring("--stall=".Length)
+        $validated = Convert-ValidatedNumber "--stall" $value 0
+        Write-LiftNotice "--stall" $stallFromCli
+        $StallSec = $validated
+        $stallFromCli = $true
+        $j++
+        continue
+      }
+      "--stdin" {
+        Require-NextValue "--stdin" $j $RemainingArgs.Count
+        $value = $RemainingArgs[$j + 1]
+        if ([string]::IsNullOrEmpty($value)) { Fail-Argument "--stdin value is empty" }
+        if (-not (Test-Path -LiteralPath $value -PathType Leaf)) {
+          Fail-Argument "cannot read stdin regular file: $value"
+        }
+        Write-LiftNotice "--stdin" $stdinFromCli
+        $StdinFile = $value
+        $stdinFromCli = $true
+        $j += 2
+        continue
+      }
+      "--stdin=*" {
+        $value = $current.Substring("--stdin=".Length)
+        if ([string]::IsNullOrEmpty($value)) { Fail-Argument "--stdin value is empty" }
+        if (-not (Test-Path -LiteralPath $value -PathType Leaf)) {
+          Fail-Argument "cannot read stdin regular file: $value"
+        }
+        Write-LiftNotice "--stdin" $stdinFromCli
+        $StdinFile = $value
+        $stdinFromCli = $true
+        $j++
+        continue
+      }
+      "--tail" {
+        Require-NextValue "--tail" $j $RemainingArgs.Count
+        $value = $RemainingArgs[$j + 1]
+        $validated = Convert-ValidatedNumber "--tail" $value 0
+        Write-LiftNotice "--tail" $tailFromCli
+        $TailLines = $validated
+        $tailFromCli = $true
+        $j += 2
+        continue
+      }
+      "--tail=*" {
+        $value = $current.Substring("--tail=".Length)
+        $validated = Convert-ValidatedNumber "--tail" $value 0
+        Write-LiftNotice "--tail" $tailFromCli
+        $TailLines = $validated
+        $tailFromCli = $true
+        $j++
+        continue
+      }
+      "--codex-bin" {
+        Require-NextValue "--codex-bin" $j $RemainingArgs.Count
+        $value = $RemainingArgs[$j + 1]
+        if ([string]::IsNullOrEmpty($value)) { Fail-Argument "--codex-bin value is empty" }
+        Write-LiftNotice "--codex-bin" $codexBinFromCli
+        $CodexBin = $value
+        $codexBinFromCli = $true
+        $j += 2
+        continue
+      }
+      "--codex-bin=*" {
+        $value = $current.Substring("--codex-bin=".Length)
+        if ([string]::IsNullOrEmpty($value)) { Fail-Argument "--codex-bin value is empty" }
+        Write-LiftNotice "--codex-bin" $codexBinFromCli
+        $CodexBin = $value
+        $codexBinFromCli = $true
+        $j++
+        continue
+      }
+      default {
+        $CodexArgs += $current
+        $j++
+        continue
+      }
     }
   }
 }
