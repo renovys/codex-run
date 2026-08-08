@@ -3,18 +3,20 @@
 # It detects unresponsive runs through a wall-clock limit or output silence, kills the process tree,
 # and records the log path and termination reason in a standard format so the calling agent can take over.
 # Usage: codex-run [--timeout SEC] [--stall SEC] [--stdin FILE] [--tail N] [--codex-bin PATH]
+#                  [--account personal|biz|auto]
 #                  [--help] [--version] [--] <codex args...>
 #   Example: codex-run --timeout 900 exec --sandbox danger-full-access "prompt"
-# Exit codes: 0=success / 124=wall-clock limit / 125=output stall / 2=usage or argument error / other=codex exit code
+# Exit codes: 0=success / 124=wall-clock limit / 125=output stall / 3=wrapper log/setup failure (no child started) / 2=usage or argument error / other=codex exit code
 # Compatible with macOS bash 3.2 (no associative arrays or flock).
 set -u
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 usage() {
   cat <<'EOF'
 Usage:
   codex-run [--timeout SEC] [--stall SEC] [--stdin FILE] [--tail N] [--codex-bin PATH]
+            [--account personal|biz|auto]
             [--help] [--version] [--] <codex args...>
 
 Options:
@@ -23,27 +25,80 @@ Options:
   --stdin FILE      Regular file to use as codex standard input
   --tail N          Log lines to print after exit (default: 40)
   --codex-bin PATH  codex executable (default: codex)
+  --account NAME    계정 선택: personal, biz, auto (기본: auto)
   --help            Print this help
   --version         Print version
   --                Stop parsing wrapper arguments
 
+래퍼 플래그는 exec 앞에 쓰는 것이 정석이며, exec 뒤에 와도 자동 교정됩니다.
+
+Exit codes:
+  0=success, 124=wall-clock limit, 125=output stall, 3=wrapper log/setup failure (no child started),
+  2=usage/argument error or no safe account candidate, other=codex exit code
+
 Environment:
-  CODEX_RUN_TIMEOUT, CODEX_RUN_STALL, CODEX_RUN_TAIL, CODEX_BIN
+  CODEX_RUN_TIMEOUT, CODEX_RUN_STALL, CODEX_RUN_TAIL, CODEX_BIN, CODEX_ACCOUNT
+
+자동판정은 12시간 이내 스냅샷 중 한도 미도달 계정을 대상으로 **정규화 여력**
+(남은 한도 % ÷ 리셋까지 남은 시간 h, 식은 quota_balance.py)이 큰 쪽을 고릅니다.
+리셋이 임박한 창의 남은 몫은 어차피 버려지므로 이 지표가 단순 잔량보다 낫습니다.
+최근 30분 선택에는 20% 상대 히스테리시스를 적용합니다. 잔량 예약선과 미래 reset을
+확인할 수 있는 안전 후보가 없으면 종료 2로 실패합니다. 판정 불가(없음·12시간 초과)
+계정을 우선 프로브하고, 그 외에는 3시간 넘은 선택 예정 계정만 프로브합니다. 성공
+30분 쿨다운과 실패 지수 백오프를 각각 둡니다.
 EOF
 }
 
 die() { echo "codex-run: $1" >&2; exit 2; }
+LOG_SETUP_WARN=0
+LOG_SETUP_MSG=""
+LOG_SETUP_RC=3
+log_setup_warning() {
+  LOG_SETUP_WARN=1
+  if [ -n "$LOG_SETUP_MSG" ]; then LOG_SETUP_MSG="$LOG_SETUP_MSG; $1"; else LOG_SETUP_MSG="$1"; fi
+  echo "codex-run: 경고: $1" >&2
+}
+log_setup_chmod() { # $1=mode, $2=path, $3=label; permission failure is warning-only
+  CHMOD_OUTPUT=""
+  if CHMOD_OUTPUT="$(chmod "$1" "$2" 2>&1)"; then
+    return 0
+  fi
+  if [ -n "$CHMOD_OUTPUT" ]; then
+    log_setup_warning "cannot set $3 permissions: $2 ($CHMOD_OUTPUT); continuing under watchdog"
+  else
+    log_setup_warning "cannot set $3 permissions: $2; continuing under watchdog"
+  fi
+  return 0
+}
 is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 validate_num() { # $1=name, $2=value, $3=minimum
   is_num "$2" || die "$1 must be numeric"
   [ "$2" -ge "$3" ] 2>/dev/null || die "$1 must be at least $3"
+}
+validate_account() {
+  case "$2" in personal|biz|auto) ;; *) die "$1 값은 personal, biz, auto 중 하나여야 합니다" ;; esac
 }
 
 if [ "${CODEX_RUN_TIMEOUT+x}" = "x" ]; then LIMIT="$CODEX_RUN_TIMEOUT"; else LIMIT=900; fi
 if [ "${CODEX_RUN_STALL+x}" = "x" ]; then STALL="$CODEX_RUN_STALL"; else STALL=0; fi
 if [ "${CODEX_RUN_TAIL+x}" = "x" ]; then TAIL_LINES="$CODEX_RUN_TAIL"; else TAIL_LINES=40; fi
 STDIN_FILE="/dev/null"
-CODEX_BIN="${CODEX_BIN:-codex}"
+CODEX_BIN_EXPLICIT=0
+if [ "${CODEX_BIN+x}" = "x" ]; then CODEX_BIN_EXPLICIT=1; else CODEX_BIN=codex; fi
+ACCOUNT_EXPLICIT=0
+ACCOUNT_ARG=""
+CODEX_HOME_WAS_SET=0
+[ "${CODEX_HOME+x}" = "x" ] && CODEX_HOME_WAS_SET=1
+CODEX_ACCOUNT_WAS_SET=0
+[ "${CODEX_ACCOUNT+x}" = "x" ] && CODEX_ACCOUNT_WAS_SET=1
+
+SEEN_TIMEOUT=0
+SEEN_STALL=0
+SEEN_STDIN=0
+SEEN_TAIL=0
+SEEN_CODEX_BIN=0
+SEEN_ACCOUNT=0
+WRAPPER_PARSE_STOPPED=0
 
 # codex CLI 는 구독 로그인(auth.json)을 주 경로로 쓴다. 환경에 API 키가 남아 있으면
 # 의도치 않게 종량 과금 경로가 선택될 수 있어 자식 프로세스에서 제거한다.
@@ -54,31 +109,604 @@ fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --timeout)   [ $# -ge 2 ] || die "--timeout requires a value"; validate_num "--timeout" "$2" 1; LIMIT="$2"; shift 2 ;;
-    --stall)     [ $# -ge 2 ] || die "--stall requires a value";   validate_num "--stall" "$2" 0; STALL="$2"; shift 2 ;;
-    --stdin)     [ $# -ge 2 ] || die "--stdin requires a value"; [ -f "$2" ] && [ -r "$2" ] || die "cannot read stdin regular file: $2"; STDIN_FILE="$2"; shift 2 ;;
-    --tail)      [ $# -ge 2 ] || die "--tail requires a value";    validate_num "--tail" "$2" 0; TAIL_LINES="$2"; shift 2 ;;
-    --codex-bin) [ $# -ge 2 ] || die "--codex-bin requires a value"; [ -n "$2" ] || die "--codex-bin value is empty"; CODEX_BIN="$2"; shift 2 ;;
+    --timeout)   [ $# -ge 2 ] || die "--timeout requires a value"; validate_num "--timeout" "$2" 1; LIMIT="$2"; SEEN_TIMEOUT=1; shift 2 ;;
+    --timeout=*) LIMIT="${1#*=}"; validate_num "--timeout" "$LIMIT" 1; SEEN_TIMEOUT=1; shift ;;
+    --stall)     [ $# -ge 2 ] || die "--stall requires a value";   validate_num "--stall" "$2" 0; STALL="$2"; SEEN_STALL=1; shift 2 ;;
+    --stall=*)   STALL="${1#*=}"; validate_num "--stall" "$STALL" 0; SEEN_STALL=1; shift ;;
+    --stdin)     [ $# -ge 2 ] || die "--stdin requires a value"; [ -f "$2" ] && [ -r "$2" ] || die "cannot read stdin regular file: $2"; STDIN_FILE="$2"; SEEN_STDIN=1; shift 2 ;;
+    --stdin=*)   STDIN_FILE="${1#*=}"; [ -f "$STDIN_FILE" ] && [ -r "$STDIN_FILE" ] || die "cannot read stdin regular file: $STDIN_FILE"; SEEN_STDIN=1; shift ;;
+    --tail)      [ $# -ge 2 ] || die "--tail requires a value";    validate_num "--tail" "$2" 0; TAIL_LINES="$2"; SEEN_TAIL=1; shift 2 ;;
+    --tail=*)    TAIL_LINES="${1#*=}"; validate_num "--tail" "$TAIL_LINES" 0; SEEN_TAIL=1; shift ;;
+    --codex-bin) [ $# -ge 2 ] || die "--codex-bin requires a value"; [ -n "$2" ] || die "--codex-bin value is empty"; CODEX_BIN="$2"; CODEX_BIN_EXPLICIT=1; SEEN_CODEX_BIN=1; shift 2 ;;
+    --codex-bin=*) CODEX_BIN="${1#*=}"; [ -n "$CODEX_BIN" ] || die "--codex-bin value is empty"; CODEX_BIN_EXPLICIT=1; SEEN_CODEX_BIN=1; shift ;;
+    --account)   [ $# -ge 2 ] || die "--account requires a value"; ACCOUNT_EXPLICIT=1; ACCOUNT_ARG="$2"; SEEN_ACCOUNT=1; shift 2 ;;
+    --account=*) ACCOUNT_EXPLICIT=1; ACCOUNT_ARG="${1#*=}"; validate_account "--account" "$ACCOUNT_ARG"; SEEN_ACCOUNT=1; shift ;;
     --help)      usage; exit 0 ;;
     --version)   echo "codex-run $VERSION"; exit 0 ;;
-    --)          shift; break ;;
+    --)          shift; WRAPPER_PARSE_STOPPED=1; break ;;
+    -*)          die "unknown option: $1" ;;
     *)           break ;;
   esac
 done
+
+lift_notice() { # $1=flag, $2=whether the same flag appeared before the codex arguments
+  echo "[codex-run] 안내: '$1' 래퍼 플래그는 exec 앞에 오는 것이 정석입니다. 위치를 자동 교정했습니다." >&2
+  if [ "$2" = "1" ]; then
+    echo "[codex-run] 안내: '$1' 래퍼 플래그가 exec 앞뒤에 모두 지정되어 뒤의 값을 사용합니다." >&2
+  fi
+}
+
+# A wrapper flag accidentally placed after the first codex argument is still a wrapper flag.
+# Preserve everything from an explicit `--` onward exactly as supplied.
+if [ "$WRAPPER_PARSE_STOPPED" != "1" ]; then
+  CODEX_ARGS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --)
+        while [ $# -gt 0 ]; do CODEX_ARGS[${#CODEX_ARGS[@]}]="$1"; shift; done
+        break
+        ;;
+      --timeout)
+        [ $# -ge 2 ] || die "--timeout requires a value"; validate_num "--timeout" "$2" 1
+        lift_notice "--timeout" "$SEEN_TIMEOUT"; LIMIT="$2"; SEEN_TIMEOUT=1; shift 2
+        ;;
+      --timeout=*)
+        VALUE="${1#*=}"; validate_num "--timeout" "$VALUE" 1
+        lift_notice "--timeout" "$SEEN_TIMEOUT"; LIMIT="$VALUE"; SEEN_TIMEOUT=1; shift
+        ;;
+      --stall)
+        [ $# -ge 2 ] || die "--stall requires a value"; validate_num "--stall" "$2" 0
+        lift_notice "--stall" "$SEEN_STALL"; STALL="$2"; SEEN_STALL=1; shift 2
+        ;;
+      --stall=*)
+        VALUE="${1#*=}"; validate_num "--stall" "$VALUE" 0
+        lift_notice "--stall" "$SEEN_STALL"; STALL="$VALUE"; SEEN_STALL=1; shift
+        ;;
+      --stdin)
+        [ $# -ge 2 ] || die "--stdin requires a value"
+        [ -f "$2" ] && [ -r "$2" ] || die "cannot read stdin regular file: $2"
+        lift_notice "--stdin" "$SEEN_STDIN"; STDIN_FILE="$2"; SEEN_STDIN=1; shift 2
+        ;;
+      --stdin=*)
+        VALUE="${1#*=}"; [ -f "$VALUE" ] && [ -r "$VALUE" ] || die "cannot read stdin regular file: $VALUE"
+        lift_notice "--stdin" "$SEEN_STDIN"; STDIN_FILE="$VALUE"; SEEN_STDIN=1; shift
+        ;;
+      --tail)
+        [ $# -ge 2 ] || die "--tail requires a value"; validate_num "--tail" "$2" 0
+        lift_notice "--tail" "$SEEN_TAIL"; TAIL_LINES="$2"; SEEN_TAIL=1; shift 2
+        ;;
+      --tail=*)
+        VALUE="${1#*=}"; validate_num "--tail" "$VALUE" 0
+        lift_notice "--tail" "$SEEN_TAIL"; TAIL_LINES="$VALUE"; SEEN_TAIL=1; shift
+        ;;
+      --codex-bin)
+        [ $# -ge 2 ] || die "--codex-bin requires a value"; [ -n "$2" ] || die "--codex-bin value is empty"
+        lift_notice "--codex-bin" "$SEEN_CODEX_BIN"; CODEX_BIN="$2"; CODEX_BIN_EXPLICIT=1; SEEN_CODEX_BIN=1; shift 2
+        ;;
+      --codex-bin=*)
+        VALUE="${1#*=}"; [ -n "$VALUE" ] || die "--codex-bin value is empty"
+        lift_notice "--codex-bin" "$SEEN_CODEX_BIN"; CODEX_BIN="$VALUE"; CODEX_BIN_EXPLICIT=1; SEEN_CODEX_BIN=1; shift
+        ;;
+      --account)
+        [ $# -ge 2 ] || die "--account requires a value"; validate_account "--account" "$2"
+        lift_notice "--account" "$SEEN_ACCOUNT"; ACCOUNT_EXPLICIT=1; ACCOUNT_ARG="$2"; SEEN_ACCOUNT=1; shift 2
+        ;;
+      --account=*)
+        VALUE="${1#*=}"; validate_account "--account" "$VALUE"
+        lift_notice "--account" "$SEEN_ACCOUNT"; ACCOUNT_EXPLICIT=1; ACCOUNT_ARG="$VALUE"; SEEN_ACCOUNT=1; shift
+        ;;
+      *) CODEX_ARGS[${#CODEX_ARGS[@]}]="$1"; shift ;;
+    esac
+  done
+  set -- ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"}
+fi
 
 validate_num "--timeout/CODEX_RUN_TIMEOUT" "$LIMIT" 1
 validate_num "--stall/CODEX_RUN_STALL" "$STALL" 0
 validate_num "--tail/CODEX_RUN_TAIL" "$TAIL_LINES" 0
 [ $# -gt 0 ] || die "no arguments. See codex-run --help"
 
-LOGDIR="$HOME/.codex-runs"
-(umask 077; mkdir -p "$LOGDIR")
-chmod 700 "$LOGDIR" || die "cannot set log directory permissions: $LOGDIR"
+if [ "$ACCOUNT_EXPLICIT" = "1" ]; then
+  validate_account "--account" "$ACCOUNT_ARG"
+fi
+if [ "$CODEX_ACCOUNT_WAS_SET" = "1" ]; then
+  validate_account "CODEX_ACCOUNT" "$CODEX_ACCOUNT"
+fi
+
+PROBE_SEC=0
+if [ "$ACCOUNT_EXPLICIT" = "1" ]; then
+  REQUESTED_ACCOUNT="$ACCOUNT_ARG"
+elif [ "$CODEX_HOME_WAS_SET" = "1" ]; then
+  # 정비 경로는 호출자가 정한 CODEX_HOME을 그대로 쓴다. 알려진 회사 경로만 biz로 표기한다.
+  if [ "$CODEX_HOME" = "$HOME/.codex-biz" ]; then SELECTED_ACCOUNT=biz; else SELECTED_ACCOUNT=personal; fi
+  REQUESTED_ACCOUNT=preserve
+elif [ "$CODEX_ACCOUNT_WAS_SET" = "1" ]; then
+  REQUESTED_ACCOUNT="$CODEX_ACCOUNT"
+else
+  REQUESTED_ACCOUNT=auto
+fi
+
+if [ "$REQUESTED_ACCOUNT" = "personal" ]; then
+  SELECTED_ACCOUNT=personal
+  export CODEX_HOME="$HOME/.codex"
+elif [ "$REQUESTED_ACCOUNT" = "biz" ]; then
+  SELECTED_ACCOUNT=biz
+  export CODEX_HOME="$HOME/.codex-biz"
+elif [ "$REQUESTED_ACCOUNT" = "auto" ]; then
+  ROUTE_RESULT="$(python3 - <<'PY'
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import fcntl
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home() / ".local" / "bin"))
+from gpt_quota import both
+from quota_balance import RESERVE_REMAINING_PCT, headroom
+
+STALE_H = 12
+PROBE_MAX_AGE_H = 3.0
+FULL_PCT = 95
+# 히스테리시스는 점수 단위가 아니라 **상대 비율**로 잡는다. 점수가 정규화 여력
+# (-%/시간)으로 바뀌면서 절대값이 0.2~0.6 규모가 됐는데, 옛 절대 눈금 10을 그대로
+# 두면 두 계정이 언제나 "차이 없음"으로 판정돼 히스테리시스가 영구 고착되고
+# 프로브도 매번 돌게 된다. 비율이면 폴백 경로(잔량 기준)에서도 뜻이 유지된다.
+HYST_RATIO = 0.20
+STICKY_MIN = 30
+STATE = Path.home() / ".codex-account.state"
+STATE_LOCK = Path.home() / ".codex-account.state.lock"
+HOMES = {"personal": str(Path.home() / ".codex"), "biz": str(Path.home() / ".codex-biz")}
+started = time.monotonic()
+probe_sec = 0
+
+def load_state():
+    try:
+        with STATE.open(encoding="utf-8") as f:
+            value = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (ValueError, TypeError) as exc:
+        print("codex-run: 경고: 계정 상태 JSON이 손상되어 기본값으로 복구합니다: %s" % exc,
+              file=sys.stderr)
+        return {}
+    except OSError as exc:
+        print("codex-run: 경고: 계정 상태파일을 읽지 못해 기본값으로 복구합니다: %s" % exc,
+              file=sys.stderr)
+        return {}
+    if not isinstance(value, dict):
+        print("codex-run: 경고: 계정 상태 JSON이 객체가 아니어서 기본값으로 복구합니다",
+              file=sys.stderr)
+        return {}
+    return value
+
+def age(item):
+    value = item.get("age_hours")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+def pct(item):
+    try:
+        return float(item.get("pct"))
+    except (TypeError, ValueError):
+        return None
+
+def reset_dt(item):
+    value = item.get("resets_at_kst")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo is not None else None
+    except (TypeError, ValueError):
+        return None
+
+def usable(item):
+    a = age(item)
+    return pct(item) is not None and a is not None and a <= STALE_H
+
+def score(item, now=None):
+    """작을수록 좋다. 계산은 quota_balance.headroom만 사용한다."""
+    p = pct(item)
+    a = age(item)
+    if p is None or a is None:
+        return None
+    reset = reset_dt(item)
+    hours = None
+    if reset is not None:
+        reference = (datetime.fromtimestamp(now, reset.tzinfo)
+                     if now is not None else datetime.now(reset.tzinfo))
+        hours = (reset - reference).total_seconds() / 3600.0
+    h = headroom(p, hours, a)
+    if h is None or not math.isfinite(h):
+        return None
+    return -h
+
+def close_enough(a, b):
+    """두 점수가 판정을 뒤집을 만큼 차이 나지 않는가(상대 비율)."""
+    if a is None or b is None:
+        return False
+    scale = max(abs(a), abs(b), 1e-6)
+    return abs(a - b) <= HYST_RATIO * scale
+
+def is_live(item):
+    p = pct(item)
+    reset = reset_dt(item)
+    reset_is_future = reset is not None and reset > datetime.now(reset.tzinfo)
+    return (usable(item) and not bool(item.get("reached")) and p is not None
+            and p < FULL_PCT and 100.0 - p >= RESERVE_REMAINING_PCT
+            and reset_is_future and score(item) is not None)
+
+def choose(data, state, now, excluded=None):
+    """안전 후보만 대상으로 히스테리시스와 정규화 여력을 적용한다."""
+    excluded = set() if excluded is None else set(excluded)
+    live = [name for name in ("personal", "biz")
+            if name not in excluded and is_live(data.get(name) or {})]
+    if not live:
+        return None
+    # 같은 선택 사이클은 동일 기준시각으로 계산해 완전히 같은 입력이 호출 순서에 따라
+    # 몇 마이크로초 차이 나는 일을 막는다.
+    scores = {name: score(data[name], now) for name in live}
+    previous = state.get("account")
+    try:
+        sticky = now - float(state.get("ts")) <= STICKY_MIN * 60
+    except (TypeError, ValueError):
+        sticky = False
+    if previous in live and sticky:
+        other = "biz" if previous == "personal" else "personal"
+        previous_score = scores[previous]
+        other_score = scores.get(other)
+        if other_score is None or (previous_score is not None
+                                   and (previous_score <= other_score
+                                        or close_enough(previous_score, other_score))):
+            return previous
+    best_score = min(scores.values())
+    tied = sorted(name for name in live if scores[name] == best_score)
+    if len(tied) == 1:
+        return tied[0]
+    # 완전 동률은 sticky 창이 끝날 때 직전 계정의 반대쪽으로 넘긴다. 이력이 없으면
+    # 30분 시간 슬롯을 번갈아 써서 결정론을 유지하되 personal에 고착되지 않게 한다.
+    if previous in tied:
+        return next(name for name in tied if name != previous)
+    return tied[int(now // (STICKY_MIN * 60)) % len(tied)]
+
+def acquire_state_lock(wait_sec=2.0):
+    """짧게만 락을 기다린다. 상태 병합은 짧고 프로브는 락 밖이므로 2초면 충분하다.
+
+    락 보유자가 멈춘 경우에도 작업 timeout이 시작되기 전 래퍼가 무한 대기하지 않도록
+    상한 뒤에는 경고하고 fail-open한다.
+    """
+    try:
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(STATE_LOCK), os.O_CREAT | os.O_RDWR, 0o600)
+        os.fchmod(fd, 0o600)
+        deadline = time.monotonic() + wait_sec
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("%.1f초 대기 상한 초과" % wait_sec)
+                time.sleep(0.05)
+    except OSError as exc:
+        try:
+            os.close(fd)
+        except (OSError, UnboundLocalError):
+            pass
+        print("codex-run: 경고: 계정 상태파일 락을 얻지 못해 안전하게 진행할 수 없습니다: %s" % exc,
+              file=sys.stderr)
+        sys.exit(2)
+
+def save_state(value):
+    try:
+        atomic_state(value)
+    except OSError as exc:
+        print("codex-run: 경고: 계정 상태파일을 기록하지 못했습니다: %s" % exc,
+              file=sys.stderr)
+
+def finish(value, selected_account):
+    """선택 결과를 상태에 반영하고 라우터 반환값을 출력한다."""
+    if value.get("account") != selected_account:
+        value["ts"] = time.time()
+    value["account"] = selected_account
+    save_state(value)
+    print("%s %d %s" % (selected_account, probe_sec, probe_bin or "-"))
+
+def release_state_lock(fd):
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    except OSError as exc:
+        print("codex-run: 경고: 계정 상태파일 락 해제 실패: %s" % exc, file=sys.stderr)
+
+def atomic_state(value):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".codex-account.state.", dir=str(STATE.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(value, f, ensure_ascii=False, separators=(",", ":"))
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, STATE)  # 같은 파일시스템의 mv와 같은 원자 교체
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+probe_candidate = None
+reservation_token = None
+probe_bin = (shutil.which("codex")
+             or next((c for c in (str(Path.home() / ".local" / "bin" / "codex"),
+                                  "/opt/homebrew/bin/codex", "/usr/local/bin/codex")
+                      if os.path.exists(c)), None))
+lock_fd = acquire_state_lock()
+try:
+    state = load_state()
+    data = both()
+    now = time.time()
+    selected = choose(data, state, now)
+
+    # choose()의 판정 근거가 될 수 없는 계정은 별도로 프로브 후보에 올린다. 없음을
+    # 가장 오래된 것으로 보고 한 번에 하나만 갱신한다.
+    unknown = [name for name in ("personal", "biz")
+               if not usable(data.get(name) or {})]
+    if unknown:
+        candidate = max(
+            unknown,
+            key=lambda name: (age(data.get(name) or {}) is None,
+                              age(data.get(name) or {}) or 0.0),
+        )
+    elif selected is not None and (age(data[selected]) or 0.0) > PROBE_MAX_AGE_H:
+        candidate = selected
+    else:
+        candidate = None
+
+    if selected is None and candidate is None:
+        print("codex-run: 경고: 안전하게 선택할 GPT 계정이 없습니다", file=sys.stderr)
+        sys.exit(2)
+
+    probes = state.get("probes") if isinstance(state.get("probes"), dict) else {}
+    failures = state.get("probe_failures") if isinstance(state.get("probe_failures"), dict) else {}
+    reservations = (state.get("probe_reservations")
+                    if isinstance(state.get("probe_reservations"), dict) else {})
+    success_cooling = False
+    failure_cooling = False
+    reservation_cooling = False
+    if candidate is not None:
+        try:
+            success_cooling = now - float(probes.get(candidate)) < STICKY_MIN * 60
+        except (TypeError, ValueError):
+            pass
+        failure = failures.get(candidate) if isinstance(failures.get(candidate), dict) else {}
+        try:
+            failure_cooling = now < float(failure.get("retry_after"))
+        except (TypeError, ValueError):
+            pass
+        reservation = (reservations.get(candidate)
+                       if isinstance(reservations.get(candidate), dict) else {})
+        try:
+            reservation_cooling = now < float(reservation.get("until"))
+        except (TypeError, ValueError):
+            pass
+
+    needs_probe = candidate is not None and not success_cooling
+    if needs_probe and failure_cooling:
+        selected = choose(data, state, now, {candidate})
+        if selected is None:
+            print("codex-run: 경고: 프로브 백오프 중인 계정을 제외하면 안전 후보가 없습니다",
+                  file=sys.stderr)
+            sys.exit(2)
+        finish(state, selected)
+        sys.exit(0)
+
+    # 다른 프로세스가 갱신 중이면 현재의 신선한 안전 후보만 쓴다.
+    if needs_probe and reservation_cooling:
+        if selected is None:
+            print("codex-run: 경고: 판정 불가 계정의 프로브가 이미 진행 중이며 안전 후보가 없습니다",
+                  file=sys.stderr)
+            sys.exit(2)
+        finish(state, selected)
+        sys.exit(0)
+
+    if needs_probe and time.monotonic() - started < 60:
+        probe_candidate = candidate
+        reservation_token = os.urandom(12).hex()
+        reservations[candidate] = {"token": reservation_token, "until": now + 65}
+        state["probe_reservations"] = reservations
+        save_state(state)
+    else:
+        if selected is None:
+            print("codex-run: 경고: 판정 불가 계정을 갱신하지 못했고 안전 후보가 없습니다",
+                  file=sys.stderr)
+            sys.exit(2)
+        finish(state, selected)
+        sys.exit(0)
+finally:
+    release_state_lock(lock_fd)
+
+# 최대 45초인 외부 프로브는 어떤 경우에도 라우팅 락을 보유하지 않은 채 실행한다.
+probe_started = time.monotonic()
+before_ts = (data.get(probe_candidate) or {}).get("ts")
+if probe_bin is None:
+    lock_fd = acquire_state_lock()
+    try:
+        state = load_state()
+        reservations = (state.get("probe_reservations")
+                        if isinstance(state.get("probe_reservations"), dict) else {})
+        reservation = (reservations.get(probe_candidate)
+                       if isinstance(reservations.get(probe_candidate), dict) else {})
+        if reservation.get("token") == reservation_token:
+            reservations.pop(probe_candidate, None)
+        state["probe_reservations"] = reservations
+        save_state(state)
+    finally:
+        release_state_lock(lock_fd)
+    print("codex-run: 경고: 프로브에 필요한 codex 실행 파일을 찾지 못했습니다", file=sys.stderr)
+    sys.exit(2)
+env = os.environ.copy()
+env["CODEX_HOME"] = HOMES[probe_candidate]
+probe_rc = None
+probe_error = None
+try:
+    # GNU `timeout` 은 맥에 기본 설치가 아니다. 아래 subprocess timeout 이 이미 상한을
+    # 걸고 있으므로 외부 명령에 기대지 않는다. `codex` 도 이름만 쓰면 비대화 셸의
+    # 빈약한 PATH 에서 못 찾으므로(exit 127 사례) 절대경로로 풀어 쓴다.
+    proc = subprocess.run(
+        [probe_bin, "exec", "--sandbox", "read-only",
+         "ok 한 글자만 답하고 끝내라. 도구를 쓰지 마라."],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        env=env, check=False, timeout=max(1, 60 - (time.monotonic() - started)),
+        text=True,
+    )
+    probe_rc = proc.returncode
+    stderr_lines = [line.strip() for line in (proc.stderr or "").splitlines() if line.strip()]
+    if stderr_lines:
+        probe_error = stderr_lines[-1][:500]
+except subprocess.TimeoutExpired as exc:
+    probe_error = "timeout"
+    if exc.stderr:
+        raw_error = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else exc.stderr
+        stderr_lines = [line.strip() for line in raw_error.splitlines() if line.strip()]
+        if stderr_lines:
+            probe_error += ": " + stderr_lines[-1][:480]
+except OSError as exc:
+    probe_error = "%s: %s" % (type(exc).__name__, exc)
+probe_sec = max(1, int(math.ceil(time.monotonic() - probe_started)))
+refreshed = both()
+after_ts = (refreshed.get(probe_candidate) or {}).get("ts")
+probe_succeeded = probe_rc == 0 and after_ts is not None and after_ts != before_ts
+if not probe_succeeded:
+    if probe_error:
+        reason = "exit=%s, %s" % (probe_rc, probe_error)
+    elif probe_rc != 0:
+        reason = "exit=%s" % probe_rc
+    else:
+        reason = "exit=0, snapshot unchanged"
+    print("codex-run: 경고: %s 계정 프로브 실패(%s)" % (probe_candidate, reason),
+          file=sys.stderr)
+
+# 프로브 중 다른 호출이 기록한 계정 상태를 잃지 않도록 최신 상태에 결과를 병합한다.
+lock_fd = acquire_state_lock()
+try:
+    state = load_state()
+    probes = state.get("probes") if isinstance(state.get("probes"), dict) else {}
+    failures = state.get("probe_failures") if isinstance(state.get("probe_failures"), dict) else {}
+    reservations = (state.get("probe_reservations")
+                    if isinstance(state.get("probe_reservations"), dict) else {})
+    reservation = (reservations.get(probe_candidate)
+                   if isinstance(reservations.get(probe_candidate), dict) else {})
+    if reservation.get("token") == reservation_token:
+        reservations.pop(probe_candidate, None)
+    if probe_succeeded:
+        probes[probe_candidate] = time.time()
+        failures.pop(probe_candidate, None)
+        excluded = set()
+    else:
+        previous_failure = failures.get(probe_candidate)
+        previous_count = ((previous_failure or {}).get("count", 0)
+                          if isinstance(previous_failure, dict) else 0)
+        try:
+            failure_count = max(0, int(previous_count)) + 1
+        except (TypeError, ValueError):
+            failure_count = 1
+        delay = min(30 * 60, 5 * 60 * (2 ** (failure_count - 1)))
+        failed_at = time.time()
+        failures[probe_candidate] = {"ts": failed_at, "count": failure_count,
+                                     "retry_after": failed_at + delay}
+        excluded = {probe_candidate}
+    state["probes"] = probes
+    state["probe_failures"] = failures
+    state["probe_reservations"] = reservations
+    selected = choose(refreshed, state, time.time(), excluded)
+    if selected is None:
+        save_state(state)
+        print("codex-run: 경고: 프로브 실패 계정을 제외하면 안전 후보가 없습니다",
+              file=sys.stderr)
+        sys.exit(2)
+    finish(state, selected)
+finally:
+    release_state_lock(lock_fd)
+PY
+)" || die "자동 계정 판정에 실패했습니다"
+  SELECTED_ACCOUNT="${ROUTE_RESULT%% *}"
+  ROUTE_REST="${ROUTE_RESULT#* }"
+  PROBE_SEC="${ROUTE_REST%% *}"
+  ROUTED_CODEX_BIN="${ROUTE_REST#* }"
+  if [ "$CODEX_BIN_EXPLICIT" != "1" ] && [ "$ROUTED_CODEX_BIN" != "-" ]; then
+    CODEX_BIN="$ROUTED_CODEX_BIN"
+  fi
+  case "$SELECTED_ACCOUNT" in
+    personal) export CODEX_HOME="$HOME/.codex" ;;
+    biz) export CODEX_HOME="$HOME/.codex-biz" ;;
+    *) die "자동 계정 판정이 잘못된 계정 값을 반환했습니다" ;;
+  esac
+fi
+
+# 계정 명시 경로는 Python 라우터를 거치지 않으므로, 사용자가 실행 파일을 지정하지
+# 않았을 때만 같은 후보 순서로 절대경로를 한 번 더 찾는다.
+if ! command -v "$CODEX_BIN" >/dev/null 2>&1 && [ "$CODEX_BIN_EXPLICIT" != "1" ]; then
+  for candidate in "$HOME/.local/bin/codex" /opt/homebrew/bin/codex /usr/local/bin/codex; do
+    if [ -x "$candidate" ]; then CODEX_BIN="$candidate"; break; fi
+  done
+fi
+
+if [ "$SELECTED_ACCOUNT" = "biz" ]; then LOGDIR="$HOME/.codex-runs-biz"; else LOGDIR="$HOME/.codex-runs"; fi
+MKDIR_OUTPUT=""
+if ! MKDIR_OUTPUT="$(umask 077; mkdir -p "$LOGDIR" 2>&1)"; then
+  if [ -n "$MKDIR_OUTPUT" ]; then
+    echo "codex-run: cannot prepare log directory: $LOGDIR ($MKDIR_OUTPUT); no child started (exit $LOG_SETUP_RC)" >&2
+  else
+    echo "codex-run: cannot prepare log directory: $LOGDIR; no child started (exit $LOG_SETUP_RC)" >&2
+  fi
+  exit "$LOG_SETUP_RC"
+fi
+if [ ! -d "$LOGDIR" ] || [ -L "$LOGDIR" ] || [ ! -r "$LOGDIR" ] || [ ! -x "$LOGDIR" ] || [ ! -w "$LOGDIR" ]; then
+  echo "codex-run: cannot use log directory: $LOGDIR; no child started (exit $LOG_SETUP_RC)" >&2
+  exit "$LOG_SETUP_RC"
+fi
+log_setup_chmod 700 "$LOGDIR" "log directory"
 find "$LOGDIR" -name '*.log' -mtime +14 -delete 2>/dev/null   # Prune run logs older than 14 days.
 STAMP="$(date +%Y%m%d-%H%M%S)"
-LOG="$LOGDIR/$STAMP-$$.log"
-(umask 077; : > "$LOG")
-chmod 600 "$LOG" || die "cannot set log file permissions: $LOG"
+LOG_BASE="$LOGDIR/$STAMP-$$"
+LOG="$LOG_BASE.log"
+LOG_SEQ=0
+LOG_CREATED=0
+while [ "$LOG_SEQ" -le 99 ]; do
+  if [ -e "$LOG" ] || [ -L "$LOG" ]; then
+    LOG_SEQ=$((LOG_SEQ + 1))
+    LOG="$LOG_BASE-$LOG_SEQ.log"
+    continue
+  fi
+  if (umask 077; set -C; : > "$LOG") 2>/dev/null; then
+    LOG_CREATED=1
+    break
+  fi
+  LOG_SEQ=$((LOG_SEQ + 1))
+  LOG="$LOG_BASE-$LOG_SEQ.log"
+done
+if [ "$LOG_CREATED" != "1" ]; then
+  echo "codex-run: cannot create a private log file in $LOGDIR; no child started (exit $LOG_SETUP_RC)" >&2
+  exit "$LOG_SETUP_RC"
+fi
+log_setup_chmod 600 "$LOG" "log file"
+if [ ! -f "$LOG" ] || [ -L "$LOG" ]; then
+  echo "codex-run: log path is not a regular file: $LOG; no child started (exit $LOG_SETUP_RC)" >&2
+  exit "$LOG_SETUP_RC"
+fi
 
 mtime_of() {   # File modification time (epoch), with separate Linux and macOS forms.
   if stat -c %Y "$1" 2>/dev/null; then return 0; fi
@@ -115,11 +743,16 @@ cleanup() {     # Do not orphan codex when the wrapper is terminated externally.
 trap 'cleanup; exit 143' INT TERM HUP
 
 START=$SECONDS
+HEADER_OK=1
 {
   echo "# codex-run start: $(date '+%Y-%m-%d %H:%M:%S') / timeout ${LIMIT}s / stall ${STALL}s / stdin ${STDIN_FILE}"
   echo "# command: $CODEX_BIN $*"
   echo "#---"
-} >> "$LOG"
+} >> "$LOG" || HEADER_OK=0
+if [ "$HEADER_OK" != "1" ]; then
+  echo "codex-run: cannot write log file: $LOG; no child started (exit $LOG_SETUP_RC)" >&2
+  exit "$LOG_SETUP_RC"
+fi
 
 # Close stdin with /dev/null by default because leaving it open can make codex wait forever for more input.
 "$CODEX_BIN" "$@" >>"$LOG" 2>&1 <"$STDIN_FILE" &
@@ -160,6 +793,7 @@ done
 if [ "$REASON" = "ok" ]; then
   wait "$CPID"
   RC=$?
+  CODEX_RC="$RC"
   DECISION_ELAPSED=$(( SECONDS - START ))
 else
   kill_tree TERM
@@ -169,6 +803,8 @@ else
   wait "$CPID" 2>/dev/null
   if [ "$REASON" = "timeout" ]; then RC=124; else RC=125; fi
 fi
+# 로그 준비 경고는 작업 성공을 실패로 뒤집지 않는다. 경고는 stderr와 요약에만 남긴다.
+# (자식을 아예 못 띄운 치명 경우는 위에서 이미 LOG_SETUP_RC로 즉시 종료한다.)
 trap - INT TERM HUP
 
 # Check for survivors so the caller knows about them before taking over.
@@ -181,11 +817,25 @@ echo "----- codex output (last ${TAIL_LINES} lines) -----"
 tail -n "$TAIL_LINES" "$LOG"
 echo "----- codex-run summary -----"
 case "$REASON" in
-  ok)      echo "status: exited normally (codex exit code $RC)" ;;
+  ok)
+    if [ "$LOG_SETUP_WARN" = "1" ]; then
+      echo "status: exited normally (codex exit code $CODEX_RC); wrapper log/setup warning"
+    else
+      echo "status: exited normally (codex exit code $RC)"
+    fi
+    ;;
   timeout) echo "status: wall-clock limit of ${LIMIT}s exceeded - terminated; caller should take over" ;;
   stall)   echo "status: no output for ${STALL}s (presumed stalled) - terminated; caller should take over" ;;
 esac
+[ "$LOG_SETUP_WARN" = "1" ] && echo "warning: $LOG_SETUP_MSG; wrapper exit code $RC (timeout/stall code takes precedence when applicable)"
 [ "$LEFT" = "1" ] && echo "warning: codex process still running (PID $CPID) - inspect it before delegating again"
 echo "decision at: ${DECISION_ELAPSED}s / total elapsed: ${TOTAL_ELAPSED}s / full log: $LOG"
-echo "codex-run: status=$REASON exit_code=$RC elapsed_sec=$TOTAL_ELAPSED log=$LOG"
+# 요약줄만 보는 자동화가 "정상 종료했지만 실패한 실행"을 성공으로 읽지 않게 한다.
+STATUS="$REASON"
+[ "$REASON" = "ok" ] && [ "$RC" != "0" ] && STATUS="failed"
+if [ "$LOG_SETUP_WARN" = "1" ]; then
+  echo "codex-run: status=$STATUS exit_code=$RC elapsed_sec=$TOTAL_ELAPSED log=$LOG account=$SELECTED_ACCOUNT probe=$PROBE_SEC wrapper_warning=log_setup codex_exit_code=${CODEX_RC:-n/a}"
+else
+  echo "codex-run: status=$STATUS exit_code=$RC elapsed_sec=$TOTAL_ELAPSED log=$LOG account=$SELECTED_ACCOUNT probe=$PROBE_SEC"
+fi
 exit "$RC"
