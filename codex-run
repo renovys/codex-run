@@ -230,7 +230,13 @@ else
   REQUESTED_ACCOUNT=auto
 fi
 
-[ "$REQUESTED_ACCOUNT" = "auto" ] || ROUTE_REASON="explicit:$REQUESTED_ACCOUNT"
+# preserve 는 호출자가 CODEX_HOME 을 직접 정한 정비 경로다. 사유에 "preserve" 를
+# 그대로 쓰면 어느 계정으로 갔는지가 안 보이므로 판정된 계정명을 붙인다.
+if [ "$REQUESTED_ACCOUNT" = "preserve" ]; then
+  ROUTE_REASON="preserve:$SELECTED_ACCOUNT"
+elif [ "$REQUESTED_ACCOUNT" != "auto" ]; then
+  ROUTE_REASON="explicit:$REQUESTED_ACCOUNT"
+fi
 
 if [ "$REQUESTED_ACCOUNT" = "personal" ]; then
   SELECTED_ACCOUNT=personal
@@ -434,14 +440,18 @@ def save_state(value):
         print("codex-run: 경고: 계정 상태파일을 기록하지 못했습니다: %s" % exc,
               file=sys.stderr)
 
-def finish(value, selected_account):
-    """선택 결과를 상태에 반영하고 라우터 반환값을 출력한다."""
+def finish(value, selected_account, snapshot):
+    """선택 결과를 상태에 반영하고 라우터 반환값을 출력한다.
+
+    snapshot은 선택 근거가 된 바로 그 한도 데이터다. 프로브 뒤에는 갱신본이
+    선택에 쓰이므로, 요약 줄이 옛 값을 보여주지 않도록 호출부가 명시해 넘긴다.
+    """
     if value.get("account") != selected_account:
         value["ts"] = time.time()
     value["account"] = selected_account
     save_state(value)
     print("%s %d %s %s" % (selected_account, probe_sec,
-                           route_reason(data, selected_account), probe_bin or "-"))
+                           route_reason(snapshot, selected_account), probe_bin or "-"))
 
 def release_state_lock(fd):
     if fd is None:
@@ -533,7 +543,7 @@ try:
             print("codex-run: 경고: 프로브 백오프 중인 계정을 제외하면 안전 후보가 없습니다",
                   file=sys.stderr)
             sys.exit(2)
-        finish(state, selected)
+        finish(state, selected, data)
         sys.exit(0)
 
     # 다른 프로세스가 갱신 중이면 현재의 신선한 안전 후보만 쓴다.
@@ -542,7 +552,7 @@ try:
             print("codex-run: 경고: 판정 불가 계정의 프로브가 이미 진행 중이며 안전 후보가 없습니다",
                   file=sys.stderr)
             sys.exit(2)
-        finish(state, selected)
+        finish(state, selected, data)
         sys.exit(0)
 
     if needs_probe and time.monotonic() - started < 60:
@@ -556,7 +566,7 @@ try:
             print("codex-run: 경고: 판정 불가 계정을 갱신하지 못했고 안전 후보가 없습니다",
                   file=sys.stderr)
             sys.exit(2)
-        finish(state, selected)
+        finish(state, selected, data)
         sys.exit(0)
 finally:
     release_state_lock(lock_fd)
@@ -589,7 +599,7 @@ try:
     # 걸고 있으므로 외부 명령에 기대지 않는다. `codex` 도 이름만 쓰면 비대화 셸의
     # 빈약한 PATH 에서 못 찾으므로(exit 127 사례) 절대경로로 풀어 쓴다.
     proc = subprocess.run(
-        [probe_bin, "exec", "--sandbox", "read-only",
+        [probe_bin, "exec", "--skip-git-repo-check", "--sandbox", "read-only",
          "ok 한 글자만 답하고 끝내라. 도구를 쓰지 마라."],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         env=env, check=False, timeout=max(1, 60 - (time.monotonic() - started)),
@@ -660,7 +670,7 @@ try:
         print("codex-run: 경고: 프로브 실패 계정을 제외하면 안전 후보가 없습니다",
               file=sys.stderr)
         sys.exit(2)
-    finish(state, selected)
+    finish(state, selected, refreshed)
 finally:
     release_state_lock(lock_fd)
 PY
