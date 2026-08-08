@@ -111,7 +111,8 @@ check "bare exec with empty arg array" 0 $?
 # --- Help and version (must not call codex) ---
 "$CR" --help >/dev/null 2>&1
 check "--help rc=0" 0 $?
-"$CR" --version 2>/dev/null | grep -q "0\.1\.0"
+# Pin the shape, not the number - the version bumps and the test should not have to follow.
+"$CR" --version 2>/dev/null | grep -qE "^codex-run [0-9]+\.[0-9]+\.[0-9]+$"
 check "--version string" 0 $?
 
 # --- stdin delivery ---

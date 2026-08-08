@@ -124,6 +124,9 @@ while [ $# -gt 0 ]; do
     --help)      usage; exit 0 ;;
     --version)   echo "codex-run $VERSION"; exit 0 ;;
     --)          shift; WRAPPER_PARSE_STOPPED=1; break ;;
+    # 단독 "-"는 옵션이 아니라 "표준입력에서 읽어라"라는 codex 쪽 인자다.
+    # -* 에 먼저 걸려 죽으면 `--stdin <파일> ... -` 관용구가 통째로 막힌다.
+    -)           break ;;
     -*)          die "unknown option: $1" ;;
     *)           break ;;
   esac
@@ -359,7 +362,7 @@ def route_reason(data, selected_account):
         p = pct(item)
         tag = "%s=%s" % (name, "?" if p is None else "%.0f%%" % p)
         if not is_live(item):
-            tag += "(제외)"
+            tag += "(skip)"
         parts.append(tag)
     return "auto[%s]" % ",".join(parts)
 
