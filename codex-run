@@ -214,6 +214,7 @@ if [ "$CODEX_ACCOUNT_WAS_SET" = "1" ]; then
 fi
 
 PROBE_SEC=0
+ROUTE_REASON=explicit
 if [ "$ACCOUNT_EXPLICIT" = "1" ]; then
   REQUESTED_ACCOUNT="$ACCOUNT_ARG"
 elif [ "$CODEX_HOME_WAS_SET" = "1" ]; then
@@ -225,6 +226,8 @@ elif [ "$CODEX_ACCOUNT_WAS_SET" = "1" ]; then
 else
   REQUESTED_ACCOUNT=auto
 fi
+
+[ "$REQUESTED_ACCOUNT" = "auto" ] || ROUTE_REASON="explicit:$REQUESTED_ACCOUNT"
 
 if [ "$REQUESTED_ACCOUNT" = "personal" ]; then
   SELECTED_ACCOUNT=personal
@@ -344,6 +347,22 @@ def is_live(item):
             and p < FULL_PCT and 100.0 - p >= RESERVE_REMAINING_PCT
             and reset_is_future and score(item) is not None)
 
+def route_reason(data, selected_account):
+    """왜 이 계정이 뽑혔는지 한 토큰으로 요약한다(공백 금지 — 반환값 파싱이 필드 단위다).
+
+    개인 계정이 한도 소진으로 후보에서 빠져 회사로 넘어간 경우가 겉으로 드러나지
+    않아 "개인을 안 쓴다"는 오해가 반복됐다. 잔량과 제외 사유를 요약 줄에 남긴다.
+    """
+    parts = []
+    for name in ("personal", "biz"):
+        item = data.get(name) or {}
+        p = pct(item)
+        tag = "%s=%s" % (name, "?" if p is None else "%.0f%%" % p)
+        if not is_live(item):
+            tag += "(제외)"
+        parts.append(tag)
+    return "auto[%s]" % ",".join(parts)
+
 def choose(data, state, now, excluded=None):
     """안전 후보만 대상으로 히스테리시스와 정규화 여력을 적용한다."""
     excluded = set() if excluded is None else set(excluded)
@@ -418,7 +437,8 @@ def finish(value, selected_account):
         value["ts"] = time.time()
     value["account"] = selected_account
     save_state(value)
-    print("%s %d %s" % (selected_account, probe_sec, probe_bin or "-"))
+    print("%s %d %s %s" % (selected_account, probe_sec,
+                           route_reason(data, selected_account), probe_bin or "-"))
 
 def release_state_lock(fd):
     if fd is None:
@@ -645,6 +665,9 @@ PY
   SELECTED_ACCOUNT="${ROUTE_RESULT%% *}"
   ROUTE_REST="${ROUTE_RESULT#* }"
   PROBE_SEC="${ROUTE_REST%% *}"
+  ROUTE_REST="${ROUTE_REST#* }"
+  ROUTE_REASON="${ROUTE_REST%% *}"
+  # 실행 파일 경로에 공백이 있을 수 있어 마지막 필드는 나머지 전부로 받는다.
   ROUTED_CODEX_BIN="${ROUTE_REST#* }"
   if [ "$CODEX_BIN_EXPLICIT" != "1" ] && [ "$ROUTED_CODEX_BIN" != "-" ]; then
     CODEX_BIN="$ROUTED_CODEX_BIN"
@@ -834,8 +857,8 @@ echo "decision at: ${DECISION_ELAPSED}s / total elapsed: ${TOTAL_ELAPSED}s / ful
 STATUS="$REASON"
 [ "$REASON" = "ok" ] && [ "$RC" != "0" ] && STATUS="failed"
 if [ "$LOG_SETUP_WARN" = "1" ]; then
-  echo "codex-run: status=$STATUS exit_code=$RC elapsed_sec=$TOTAL_ELAPSED log=$LOG account=$SELECTED_ACCOUNT probe=$PROBE_SEC wrapper_warning=log_setup codex_exit_code=${CODEX_RC:-n/a}"
+  echo "codex-run: status=$STATUS exit_code=$RC elapsed_sec=$TOTAL_ELAPSED log=$LOG account=$SELECTED_ACCOUNT route=$ROUTE_REASON probe=$PROBE_SEC wrapper_warning=log_setup codex_exit_code=${CODEX_RC:-n/a}"
 else
-  echo "codex-run: status=$STATUS exit_code=$RC elapsed_sec=$TOTAL_ELAPSED log=$LOG account=$SELECTED_ACCOUNT probe=$PROBE_SEC"
+  echo "codex-run: status=$STATUS exit_code=$RC elapsed_sec=$TOTAL_ELAPSED log=$LOG account=$SELECTED_ACCOUNT route=$ROUTE_REASON probe=$PROBE_SEC"
 fi
 exit "$RC"
