@@ -51,6 +51,11 @@ echo "parent"
 bash -c 'trap "" TERM; exec -a ${MARK}-hard sleep 120' &
 sleep 300
 EOF
+cat > env.sh <<'EOF'
+#!/bin/bash
+printf 'codex-home=%s\n' "$CODEX_HOME"
+exit 0
+EOF
 chmod +x ./*.sh
 
 echo "codex-run tests: $CR"
@@ -99,6 +104,56 @@ check "reject missing --stdin file" 2 $?
 check "reject --stdin directory" 2 $?
 CODEX_RUN_TIMEOUT=abc "$CR" --codex-bin /bin/echo run >/dev/null 2>&1
 check "reject nonnumeric environment" 2 $?
+
+# Explicit account selection must set the matching Codex home without routing.
+EXPLICIT_OUT="$(env -u CODEX_HOME -u CODEX_ACCOUNT "$CR" --account biz --codex-bin ./env.sh run 2>&1)"
+case "$EXPLICIT_OUT" in
+  *"codex-home=$HOME/.codex-biz"*"route=explicit:biz"*) R=0 ;;
+  *) R=1 ;;
+esac
+check "explicit account path" 0 "$R"
+
+# A caller-provided CODEX_HOME is a maintenance path and must survive unchanged.
+PRESERVED_HOME="$TD/preserved-codex-home"
+mkdir -p "$PRESERVED_HOME"
+PRESERVE_OUT="$(env -u CODEX_ACCOUNT CODEX_HOME="$PRESERVED_HOME" "$CR" --codex-bin ./env.sh run 2>&1)"
+case "$PRESERVE_OUT" in
+  *"codex-home=$PRESERVED_HOME"*"route=preserve:personal"*) R=0 ;;
+  *) R=1 ;;
+esac
+check "CODEX_HOME preserve path" 0 "$R"
+
+# README's single-file install must work without either private helper module.
+CLEAN_HOME="$TD/clean-home"
+CLEAN_BIN="$TD/clean-bin"
+CLEAN_INSTALL="$CLEAN_HOME/.local/bin"
+CLEAN_PYTHONPATH="$TD/clean-pythonpath"
+mkdir -p "$CLEAN_INSTALL" "$CLEAN_BIN" "$CLEAN_PYTHONPATH"
+cp "$CR" "$CLEAN_INSTALL/codex-run"
+cat > "$CLEAN_BIN/codex" <<'EOF'
+#!/bin/bash
+printf 'stub-called\n' >> "$HOME/stub-called"
+exit 0
+EOF
+chmod +x "$CLEAN_INSTALL/codex-run" "$CLEAN_BIN/codex"
+CLEAN_OUT="$(env -u CODEX_HOME -u CODEX_ACCOUNT -u CODEX_BIN \
+  -u CODEX_RUN_TIMEOUT -u CODEX_RUN_STALL -u CODEX_RUN_TAIL \
+  HOME="$CLEAN_HOME" PATH="$CLEAN_BIN:/usr/bin:/bin" PYTHONPATH="$CLEAN_PYTHONPATH" \
+  "$CLEAN_INSTALL/codex-run" --timeout 10 exec --sandbox read-only clean-home 2>&1)"
+CLEAN_RC=$?
+printf '  clean HOME output:\n%s\n' "$CLEAN_OUT"
+R=1
+if [ "$CLEAN_RC" -eq 2 ]; then
+  case "$CLEAN_OUT" in
+    *"codex-run: 오류: 내장 quota 폴백에서 GPT 스냅샷을 찾지 못했습니다."*"Codex CLI"*)
+      case "$CLEAN_OUT" in
+        *ImportError*|*Traceback*) ;;
+        *) R=0 ;;
+      esac
+      ;;
+  esac
+fi
+check "clean HOME embedded quota fallback" 0 "$R"
 
 # --stall 0 means monitoring is off, so it must be accepted.
 "$CR" --stall 0 --codex-bin ./ok.sh run >/dev/null 2>&1

@@ -259,8 +259,197 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path.home() / ".local" / "bin"))
-from gpt_quota import both
-from quota_balance import RESERVE_REMAINING_PCT, headroom
+FALLBACK_QUOTA = False
+try:
+    from gpt_quota import both
+    from quota_balance import RESERVE_REMAINING_PCT, headroom
+except ImportError:
+    # 공개 단일 파일 설치에서만 쓰는 최소 폴백이다. helper가 있으면 위 import 경로를 쓴다.
+    FALLBACK_QUOTA = True
+    import glob
+    import socket
+    from datetime import timedelta, timezone
+
+    KST = timezone(timedelta(hours=9))
+    GPT_TAIL_BYTES = 2_000_000
+    GPT_WEEK_MIN = 10080
+    GPT_SCAN_FILES = 60
+    GPT_SCAN_AFTER_HIT = 5
+    DEFAULT_ACCOUNT = "personal"
+    ACCOUNTS = {
+        "personal": {
+            "sessions": os.path.expanduser("~/.codex/sessions"),
+            "push_glob": os.path.expanduser("~/.model-usage/gpt-*.json"),
+        },
+        "biz": {
+            "sessions": os.path.expanduser("~/.codex-biz/sessions"),
+            "push_glob": os.path.expanduser("~/.model-usage/gptbiz-*.json"),
+        },
+    }
+    FALLBACK_SNAPSHOT_PATTERNS = (
+        os.path.join(ACCOUNTS["personal"]["sessions"], "**", "*.jsonl"),
+        ACCOUNTS["personal"]["push_glob"],
+        os.path.join(ACCOUNTS["biz"]["sessions"], "**", "*.jsonl"),
+        ACCOUNTS["biz"]["push_glob"],
+    )
+
+    def norm_account(account=DEFAULT_ACCOUNT):
+        return account if account in ACCOUNTS else DEFAULT_ACCOUNT
+
+    def parse_iso(s):
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(KST)
+        except (ValueError, AttributeError, TypeError):
+            return None
+
+    def newer_snapshot(candidate, current):
+        candidate_ts = candidate.get("ts") or ""
+        current_ts = current.get("ts") or ""
+        candidate_dt = parse_iso(candidate_ts)
+        current_dt = parse_iso(current_ts)
+        if candidate_dt is not None and current_dt is not None:
+            return candidate_dt.astimezone(timezone.utc) > current_dt.astimezone(timezone.utc)
+        return candidate_ts > current_ts
+
+    def local(account=DEFAULT_ACCOUNT):
+        account = norm_account(account)
+        sessions = ACCOUNTS[account]["sessions"]
+        try:
+            if not os.path.isdir(sessions):
+                return None
+            files = sorted(glob.glob(sessions + "/**/*.jsonl", recursive=True),
+                           key=os.path.getmtime, reverse=True)[:GPT_SCAN_FILES]
+        except OSError:
+            return None
+        found = None
+        after_hit = 0
+        for path in files:
+            if found is not None:
+                after_hit += 1
+                if after_hit > GPT_SCAN_AFTER_HIT:
+                    break
+            try:
+                size = os.path.getsize(path)
+                with open(path, "rb") as f:
+                    if size > GPT_TAIL_BYTES:
+                        f.seek(size - GPT_TAIL_BYTES)
+                        f.readline()
+                    raw = f.read().decode("utf-8", "replace")
+            except OSError:
+                continue
+            for ln in reversed(raw.splitlines()):
+                if '"rate_limits"' not in ln:
+                    continue
+                try:
+                    d = json.loads(ln)
+                except ValueError:
+                    continue
+                rl = ((d.get("payload") or {}).get("rate_limits")) or {}
+                pri = rl.get("primary") or {}
+                if pri.get("used_percent") is None or pri.get("window_minutes") != GPT_WEEK_MIN:
+                    continue
+                snap = {
+                    "account": account,
+                    "host": socket.gethostname().split(".")[0],
+                    "ts": d.get("timestamp") or "",
+                    "pct": pri.get("used_percent"),
+                    "window_minutes": pri.get("window_minutes"),
+                    "resets_at": pri.get("resets_at"),
+                    "plan": rl.get("plan_type"),
+                    "reached": rl.get("rate_limit_reached_type"),
+                }
+                if found is None or newer_snapshot(snap, found):
+                    found = snap
+                break
+        return found
+
+    def best(account=DEFAULT_ACCOUNT):
+        account = norm_account(account)
+        cands = []
+        loc = local(account)
+        if loc:
+            cands.append(loc)
+        for p in glob.glob(ACCOUNTS[account]["push_glob"]):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    d = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(d, dict):
+                continue
+            if d.get("account", DEFAULT_ACCOUNT) != account:
+                continue
+            if d.get("pct") is not None and d.get("window_minutes") == GPT_WEEK_MIN:
+                cands.append(d)
+        if not cands:
+            return None
+        newest = cands[0]
+        for candidate in cands[1:]:
+            if newer_snapshot(candidate, newest):
+                newest = candidate
+        return newest
+
+    def age_hours(g):
+        t = parse_iso((g or {}).get("ts"))
+        return None if t is None else max(0.0, (datetime.now(KST) - t).total_seconds() / 3600)
+
+    def reset_iso(g):
+        try:
+            return datetime.fromtimestamp(g["resets_at"], KST).isoformat(timespec="seconds")
+        except (KeyError, TypeError, ValueError, OSError):
+            return None
+
+    def info(account=DEFAULT_ACCOUNT):
+        account = norm_account(account)
+        g = best(account) or {}
+        return {
+            "pct": g.get("pct"),
+            "age_hours": age_hours(g) if g else None,
+            "reached": bool(g.get("reached")),
+            "plan": g.get("plan"),
+            "host": g.get("host"),
+            "resets_at_kst": reset_iso(g) if g else None,
+            "ts": g.get("ts"),
+            "account": account,
+        }
+
+    def both():
+        return {"personal": info("personal"), "biz": info("biz")}
+
+    MIN_HOURS = 0.25
+    DEFAULT_HOURS = 168.0
+    RESERVE_REMAINING_PCT = 10.0
+    MAX_HEADROOM_PER_H = 10.0
+    AGE_DISCOUNT_CAP = 4.0
+    AGE_DISCOUNT_MAX = 0.5
+
+    def headroom(used_pct, hours_left, age_hours=0.0):
+        if used_pct is None:
+            return None
+        try:
+            used = float(used_pct)
+            age = float(age_hours or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(used) or not 0.0 <= used <= 100.0:
+            return None
+        if not math.isfinite(age) or age < 0.0:
+            return None
+        remaining = 100.0 - used
+        if hours_left is None:
+            hours_left = DEFAULT_HOURS
+        else:
+            try:
+                hours_left = float(hours_left)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(hours_left) or hours_left <= 0:
+                return None
+        hours = max(MIN_HOURS, hours_left)
+        raw = remaining / hours
+        value = MAX_HEADROOM_PER_H * raw / (MAX_HEADROOM_PER_H + raw)
+        discount = min(age, AGE_DISCOUNT_CAP) / AGE_DISCOUNT_CAP * AGE_DISCOUNT_MAX
+        return value * (1.0 - discount)
 
 STALE_H = 12
 PROBE_MAX_AGE_H = 3.0
@@ -490,6 +679,13 @@ lock_fd = acquire_state_lock()
 try:
     state = load_state()
     data = both()
+    if (FALLBACK_QUOTA and
+            not any((item or {}).get("pct") is not None for item in data.values())):
+        print("codex-run: 오류: 내장 quota 폴백에서 GPT 스냅샷을 찾지 못했습니다. "
+              "확인한 파일 패턴: %s. 각 계정에서 Codex CLI를 한 번 실행해 스냅샷을 만든 "
+              "뒤 다시 실행하십시오." % ", ".join(FALLBACK_SNAPSHOT_PATTERNS),
+              file=sys.stderr)
+        sys.exit(2)
     now = time.time()
     selected = choose(data, state, now)
 

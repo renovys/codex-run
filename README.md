@@ -76,6 +76,8 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/renovys/codex-run/main/
 
 Requires `codex` on your `PATH` (or point at it with `--codex-bin`). The bash version targets bash 3.2, so it runs on stock macOS without installing a newer bash.
 
+The bash version's default automatic account routing remains a single-file install. It first tries the optional `gpt_quota.py` and `quota_balance.py` helper modules when they are available on the Python import path; otherwise, it uses the minimal implementations embedded in `codex-run`. The helpers are not required for a clean install. Automatic routing needs at least one GPT quota snapshot from a Codex CLI run in `~/.codex/sessions/**/*.jsonl`, `~/.model-usage/gpt-*.json`, `~/.codex-biz/sessions/**/*.jsonl`, or `~/.model-usage/gptbiz-*.json`. If no snapshot exists, it exits `2` with the files checked and the action needed to create one.
+
 ## Usage
 
 ```
@@ -155,8 +157,8 @@ If a process somehow survives the kill, the summary says so explicitly rather th
 
 | Platform | Shell | Status |
 | -------- | ----- | ------ |
-| Linux | bash 5.x | Verified - 23/23 |
-| macOS | bash 3.2 (stock) | Verified - 23/23 |
+| Linux | bash 5.x | Verified - 26/26 |
+| macOS | bash 3.2 (stock) | Verified - 26/26 |
 | Windows | PowerShell 5.1 | Verified - 18/18 |
 
 The suites run against stub binaries, so they never call the real Codex and cost nothing:
@@ -168,7 +170,7 @@ The suites run against stub binaries, so they never call the real Codex and cost
 .\test\run-tests.ps1             # Windows
 ```
 
-They cover normal exit, exit-code pass-through, timeout, stall, cleanup of grandchildren (including one that ignores `SIGTERM`), every argument-validation rule, `--help`/`--version`, stdin delivery, the machine-readable status line, and log permissions. CI runs the bash suite on Ubuntu and macOS and the PowerShell suite on Windows.
+They cover normal exit, exit-code pass-through, timeout, stall, cleanup of grandchildren (including one that ignores `SIGTERM`), every argument-validation rule, explicit account selection, `CODEX_HOME` preservation, clean-HOME helper fallback, `--help`/`--version`, stdin delivery, the machine-readable status line, and log permissions. CI runs the bash suite on Ubuntu and macOS and the PowerShell suite on Windows.
 
 ## License
 
